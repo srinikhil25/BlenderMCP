@@ -1,0 +1,8 @@
+smolagents[litellm]
+blender-mcp
+ollama
+python-dotenv
+requests
+fastapi
+uvicorn
+Pillow

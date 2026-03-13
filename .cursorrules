@@ -1,0 +1,27 @@
+# Local-First Creative Engineering Agent Rules
+
+## Project Context
+- **Objective:** Create an autonomous, local-first agent that plans, builds, and inspects complex artifacts across multiple tools:
+  - **Blender** for 3D procedural structures.
+  - **Obsidian** for knowledge/structure in markdown graphs.
+  - **Krita** for procedural / layered 2D compositions.
+- **Constraints:** Use ONLY free, open-source software (Blender, Obsidian, Krita, Python, Ollama).
+
+## Architecture
+- **Plan (LLM):** Decompose user prompts into structured ScenePlan JSON — a list of primitive components with transforms, materials, and modifiers. The LLM outputs JSON only, never code.
+- **Build (Deterministic):** SceneBuilder converts ScenePlan into bpy script using bpy.ops.mesh.primitive_*_add. No LLM involved in code generation.
+- **Inspect (MCP):** After execution, verify scene state via Blender MCP's get_scene_info.
+
+## Technical Standards
+- **API Version:** Use modern `bpy` (Blender 4.0+).
+- **Primitives:** Use bpy.ops.mesh.primitive_*_add (cube, sphere, cylinder, cone, plane, torus, grid).
+- **Materials:** Principled BSDF via node tree.
+- **Modifiers:** bevel, solidify, subdivision, array, mirror, boolean, wireframe, decimate.
+- **Error Handling:** All generated scripts wrapped in try/except with sanity checks.
+- **Unit Scale:** 1 unit = 1 meter.
+
+## Prohibited Behaviors
+- DO NOT have the LLM generate Python code directly. Use the deterministic SceneBuilder.
+- DO NOT use paid proprietary APIs.
+- DO NOT modify projects outside the active selection.
+- DO NOT use bpy.ops for anything other than primitive creation and basic scene cleanup.

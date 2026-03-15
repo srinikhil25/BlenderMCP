@@ -57,3 +57,4 @@ htmlcov/
 
 # Optional: uncomment if you don’t want to track agent worktrees
 # .claude/
+images/

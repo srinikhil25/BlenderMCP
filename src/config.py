@@ -4,14 +4,18 @@ Global configuration for the Local Creative Agent.
 Centralizes model names and MCP endpoints for easier tuning.
 """
 
+import os
 from dataclasses import dataclass
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env from project root
 
 
 @dataclass
 class ModelConfig:
     """Single-model setup tuned for 8GB VRAM (e.g. RTX 4060)."""
-    planner_model: str = "qwen2.5-coder:14b"
-    inspector_model: str = "qwen2.5-coder:14b"
+    planner_model: str = "qwen2.5-coder:7b"
+    inspector_model: str = "qwen2.5-coder:7b"
 
 
 @dataclass
@@ -22,15 +26,29 @@ class MCPConfig:
 model_config = ModelConfig()
 mcp_config = MCPConfig()
 
-# --- GUI pipeline settings ---
-# For 8GB VRAM: "qwen2.5-coder:14b" (best code quality) or "qwen3:14b" (best reasoning)
-# For 16GB+ VRAM: "qwen3:32b" (best overall)
-# Fallback for low VRAM: "qwen3:8b"
-OLLAMA_MODEL = "qwen2.5-coder:14b"
-OLLAMA_NUM_CTX = 12288  # larger context for complex scenes
+# --- Load persistent user settings (from ~/.blendermcp/settings.json) ---
+try:
+    from src.settings import load_settings as _load_settings, DEFAULTS as _DEFAULTS
+    _saved = _load_settings()
+except Exception:
+    _saved = {}
+    _DEFAULTS = {}
+
+# --- LLM Provider ---
+# "gemini" = Google Gemini API (free, cloud, best quality)
+# "ollama" = Local Ollama (offline, needs GPU)
+LLM_PROVIDER = _saved.get("llm_provider", "gemini")
+
+# --- Gemini settings ---
+GEMINI_API_KEY = ""  # leave empty to use env var GEMINI_API_KEY
+GEMINI_MODEL = _saved.get("gemini_model", "gemini-2.5-flash")
+
+# --- Ollama settings (local fallback) ---
+OLLAMA_MODEL = _saved.get("ollama_model", "qwen2.5-coder:7b")
+OLLAMA_NUM_CTX = _saved.get("ollama_num_ctx", 8192)
 
 # Retry settings
-MAX_RETRIES = 2  # retries after initial attempt (3 total)
+MAX_RETRIES = _saved.get("max_retries", 2)
 
 # Blender MCP command
 BLENDER_MCP_CMD = "cmd"

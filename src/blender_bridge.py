@@ -66,3 +66,38 @@ def execute_code(code: str) -> ExecutionResult:
 def get_scene_info() -> ExecutionResult:
     """Get scene info from Blender via MCP."""
     return asyncio.run(_call_tool("get_scene_info", {"random_string": "inspect"}))
+
+
+def render_preview(output_path: str, width: int = 960, height: int = 540) -> ExecutionResult:
+    """Render the current scene to an image file via MCP."""
+    # Use forward slashes to avoid Windows unicode escape issues in Blender Python
+    safe_path = output_path.replace("\\", "/")
+    render_code = f'''\
+import bpy
+
+# Store original settings
+scene = bpy.context.scene
+orig_x = scene.render.resolution_x
+orig_y = scene.render.resolution_y
+orig_pct = scene.render.resolution_percentage
+orig_path = scene.render.filepath
+
+# Set preview resolution
+scene.render.resolution_x = {width}
+scene.render.resolution_y = {height}
+scene.render.resolution_percentage = 100
+scene.render.filepath = "{safe_path}"
+scene.render.image_settings.file_format = 'PNG'
+
+# Render
+bpy.ops.render.render(write_still=True)
+
+# Restore original settings
+scene.render.resolution_x = orig_x
+scene.render.resolution_y = orig_y
+scene.render.resolution_percentage = orig_pct
+scene.render.filepath = orig_path
+
+print("SUCCESS: Preview rendered")
+'''
+    return asyncio.run(_call_tool("execute_blender_code", {"code": render_code}))

@@ -1,6 +1,7 @@
 smolagents[litellm]
 blender-mcp
 ollama
+google-genai
 python-dotenv
 requests
 fastapi

@@ -19,6 +19,7 @@ DEFAULTS: Dict[str, Any] = {
     "render_width": 960,
     "render_height": 540,
     "renderer": "cycles",
+    "render_quality": "standard",
 }
 
 
@@ -58,3 +59,4 @@ def apply_to_config(settings: Dict[str, Any]) -> None:
     cfg.OLLAMA_MODEL = settings.get("ollama_model", DEFAULTS["ollama_model"])
     cfg.OLLAMA_NUM_CTX = settings.get("ollama_num_ctx", DEFAULTS["ollama_num_ctx"])
     cfg.MAX_RETRIES = settings.get("max_retries", DEFAULTS["max_retries"])
+    cfg.RENDER_QUALITY = settings.get("render_quality", DEFAULTS["render_quality"])

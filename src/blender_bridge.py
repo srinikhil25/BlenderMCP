@@ -22,14 +22,29 @@ def _server_params() -> StdioServerParameters:
     return StdioServerParameters(command=BLENDER_MCP_CMD, args=BLENDER_MCP_ARGS)
 
 
-async def _call_tool(tool_name: str, arguments: dict) -> ExecutionResult:
-    """Open an MCP connection, call one tool, return the result."""
+async def _call_tool(
+    tool_name: str,
+    arguments: dict,
+    lenient: bool = False,
+    timeout: float | None = None,
+) -> ExecutionResult:
+    """Open an MCP connection, call one tool, return the result.
+
+    If *lenient* is True, skip heuristic error-marker scanning in stdout.
+    If *timeout* is set (seconds), abort after that duration.
+    """
     params = _server_params()
     try:
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.call_tool(tool_name, arguments=arguments)
+
+                # Wrap the tool call with an optional timeout
+                if timeout:
+                    call_coro = session.call_tool(tool_name, arguments=arguments)
+                    result = await asyncio.wait_for(call_coro, timeout=timeout)
+                else:
+                    result = await session.call_tool(tool_name, arguments=arguments)
 
                 stdout_parts: list[str] = []
                 for item in result.content:
@@ -43,7 +58,7 @@ async def _call_tool(tool_name: str, arguments: dict) -> ExecutionResult:
 
                 # Detect errors reported in stdout (blender-mcp often does this)
                 has_error = result.isError
-                if not has_error and "SUCCESS:" not in stdout:
+                if not has_error and not lenient and "SUCCESS:" not in stdout:
                     stdout_lower = stdout.lower()
                     error_markers = [
                         "error:", "traceback (", "exception:", "could not be found",
@@ -54,22 +69,43 @@ async def _call_tool(tool_name: str, arguments: dict) -> ExecutionResult:
                         stderr = stdout
 
                 return ExecutionResult(ok=not has_error, stdout=stdout, stderr=stderr)
+    except asyncio.TimeoutError:
+        secs = int(timeout) if timeout else "?"
+        return ExecutionResult(
+            ok=False, stdout="",
+            stderr=f"Operation timed out after {secs}s. The scene may be too complex or Blender is unresponsive.",
+        )
     except Exception as e:
         return ExecutionResult(ok=False, stdout="", stderr=str(e))
 
 
-def execute_code(code: str) -> ExecutionResult:
+def execute_code(code: str, timeout: float | None = None) -> ExecutionResult:
     """Execute a bpy script in Blender via MCP."""
-    return asyncio.run(_call_tool("execute_blender_code", {"code": code}))
+    from src.config import BLENDER_EXEC_TIMEOUT
+    t = timeout or BLENDER_EXEC_TIMEOUT
+    return asyncio.run(_call_tool("execute_blender_code", {"code": code}, timeout=t))
 
 
 def get_scene_info() -> ExecutionResult:
     """Get scene info from Blender via MCP."""
-    return asyncio.run(_call_tool("get_scene_info", {"random_string": "inspect"}))
+    return asyncio.run(_call_tool(
+        "get_scene_info", {"random_string": "inspect"}, lenient=True, timeout=15,
+    ))
+
+
+def ping_blender() -> bool:
+    """Quick connectivity check — returns True if Blender responds."""
+    result = asyncio.run(_call_tool(
+        "execute_blender_code",
+        {"code": "import bpy; print('SUCCESS: PONG', len(bpy.data.objects), 'objects')"},
+        timeout=10,
+    ))
+    return result.ok
 
 
 def render_preview(output_path: str, width: int = 960, height: int = 540) -> ExecutionResult:
     """Render the current scene to an image file via MCP."""
+    from src.config import RENDER_TIMEOUT
     # Use forward slashes to avoid Windows unicode escape issues in Blender Python
     safe_path = output_path.replace("\\", "/")
     render_code = f'''\
@@ -100,4 +136,6 @@ scene.render.filepath = orig_path
 
 print("SUCCESS: Preview rendered")
 '''
-    return asyncio.run(_call_tool("execute_blender_code", {"code": render_code}))
+    return asyncio.run(_call_tool(
+        "execute_blender_code", {"code": render_code}, timeout=RENDER_TIMEOUT,
+    ))

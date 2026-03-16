@@ -12,14 +12,16 @@ from tkinter import filedialog, scrolledtext
 from PIL import Image, ImageTk
 
 import src.config as cfg
-from src.blender_bridge import execute_code, get_scene_info, render_preview
+from src.blender_bridge import execute_code, get_scene_info, ping_blender, render_preview
 from src.error_messages import get_friendly_error
 from src.history import load_history, save_prompt
 from src.llm import generate_bpy_code
+from src.prompt_enricher import enrich_prompt
 from src.prompt_examples import EXAMPLES
+from src.render_history import save_render, load_history as load_render_history, RenderEntry
 from src.safety import validate_code
 from src.scene_setup import generate_camera_lighting_code
-from src.settings import load_settings as _load_settings
+from src.code_cache import cache_stats, clear_cache
 from src.settings import load_settings, save_settings, apply_to_config, DEFAULTS
 
 # ── Colours ──────────────────────────────────────────────────────────
@@ -102,6 +104,15 @@ class BlenderMCPApp(tk.Tk):
             command=self._open_settings,
         )
         settings_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # Render history gallery button
+        history_btn = tk.Button(
+            right_hdr, text="\U0001f5bc", font=("Segoe UI", 12),
+            bg=BG_DARK, fg="#94a3b8", bd=0, cursor="hand2",
+            activebackground=BG_DARK, activeforeground=FG_DARK,
+            command=self._open_render_history,
+        )
+        history_btn.pack(side=tk.RIGHT, padx=(4, 0))
 
         # Provider selector
         self._provider_var = tk.StringVar(value=cfg.LLM_PROVIDER)
@@ -205,6 +216,17 @@ class BlenderMCPApp(tk.Tk):
                         font=FONT_TINY, bg=BG_LIGHT, fg=FG_BODY, selectcolor=BG_LIGHT,
                         activebackground=BG_LIGHT).pack(side=tk.LEFT)
 
+        # Quality preset selector
+        self._quality_var = tk.StringVar(value=cfg.RENDER_QUALITY)
+        qual_frame = tk.Frame(btn_frame, bg=BG_LIGHT)
+        qual_frame.pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(qual_frame, text="Quality:", font=FONT_TINY, bg=BG_LIGHT, fg=FG_MUTED).pack(side=tk.LEFT)
+        qual_menu = tk.OptionMenu(qual_frame, self._quality_var, "draft", "standard", "high")
+        qual_menu.configure(font=FONT_TINY, bg="#e2e8f0", fg=FG_BODY,
+                            highlightthickness=0, relief=tk.FLAT)
+        qual_menu["menu"].configure(font=FONT_TINY)
+        qual_menu.pack(side=tk.LEFT)
+
         # Right-side buttons
         tk.Button(btn_frame, text="Copy Log", font=FONT_TINY, bg="#e2e8f0", fg=FG_BODY,
                   relief=tk.FLAT, padx=6, pady=3, cursor="hand2",
@@ -295,7 +317,7 @@ class BlenderMCPApp(tk.Tk):
         """Open settings dialog."""
         win = tk.Toplevel(self)
         win.title("Settings")
-        win.geometry("420x380")
+        win.geometry("420x440")
         win.resizable(False, False)
         win.configure(bg=BG_LIGHT)
         win.transient(self)
@@ -312,6 +334,7 @@ class BlenderMCPApp(tk.Tk):
             ("Max Retries", "max_retries", "int", None),
             ("Render Width", "render_width", "int", None),
             ("Render Height", "render_height", "int", None),
+            ("Render Quality", "render_quality", "str", ["draft", "standard", "high"]),
         ]
 
         frame = tk.Frame(win, bg=BG_LIGHT, padx=20, pady=16)
@@ -345,6 +368,7 @@ class BlenderMCPApp(tk.Tk):
             save_settings(new_settings)
             apply_to_config(new_settings)
             self._provider_var.set(cfg.LLM_PROVIDER)
+            self._quality_var.set(cfg.RENDER_QUALITY)
             self._log_msg("Settings saved", "success")
             win.destroy()
 
@@ -352,14 +376,89 @@ class BlenderMCPApp(tk.Tk):
             for key, var in entries.items():
                 var.set(str(DEFAULTS[key]))
 
+        # Cache info
+        cache_frame = tk.Frame(frame, bg="#f1f5f9", bd=1, relief=tk.SOLID, padx=8, pady=6)
+        cache_frame.pack(fill=tk.X, pady=(10, 0))
+        stats = cache_stats()
+        cache_info = tk.StringVar(value=f"Code cache: {stats['count']} entries ({stats['size_mb']} MB)")
+        tk.Label(cache_frame, textvariable=cache_info, font=FONT_TINY, bg="#f1f5f9", fg=FG_MUTED).pack(side=tk.LEFT)
+
+        def _clear_code_cache() -> None:
+            n = clear_cache()
+            cache_info.set(f"Code cache: 0 entries (0 MB) — cleared {n}")
+            self._log_msg(f"Cache cleared ({n} entries removed)", "info")
+
+        tk.Button(cache_frame, text="Clear Cache", font=FONT_TINY, bg="#e2e8f0", fg=FG_BODY,
+                  relief=tk.FLAT, padx=6, pady=1, command=_clear_code_cache).pack(side=tk.RIGHT)
+
         btn_row = tk.Frame(frame, bg=BG_LIGHT)
-        btn_row.pack(fill=tk.X, pady=(16, 0))
+        btn_row.pack(fill=tk.X, pady=(12, 0))
         tk.Button(btn_row, text="Save", font=FONT_BODY, bg=ACCENT, fg="white",
                   relief=tk.FLAT, padx=16, pady=4, command=_save).pack(side=tk.LEFT)
         tk.Button(btn_row, text="Reset Defaults", font=FONT_SMALL, bg="#e2e8f0", fg=FG_BODY,
                   relief=tk.FLAT, padx=10, pady=4, command=_reset).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(btn_row, text="Cancel", font=FONT_SMALL, bg="#e2e8f0", fg=FG_BODY,
                   relief=tk.FLAT, padx=10, pady=4, command=win.destroy).pack(side=tk.RIGHT)
+
+    def _open_render_history(self) -> None:
+        """Open render history gallery window."""
+        entries = load_render_history()
+        if not entries:
+            self._log_msg("No render history yet. Generate some scenes first!", "info")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Render History")
+        win.geometry("700x500")
+        win.configure(bg=BG_LIGHT)
+        win.transient(self)
+
+        tk.Label(win, text="Render History", font=FONT_HEADER, bg=BG_LIGHT, fg=FG_BODY).pack(padx=16, pady=(12, 8))
+
+        # Scrollable frame
+        canvas = tk.Canvas(win, bg=BG_LIGHT, highlightthickness=0)
+        scrollbar = tk.Scrollbar(win, orient=tk.VERTICAL, command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg=BG_LIGHT)
+
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Store PhotoImage refs to prevent GC
+        win._thumb_refs = []
+
+        for entry in reversed(entries):  # newest first
+            row = tk.Frame(scroll_frame, bg="#f1f5f9", bd=1, relief=tk.SOLID, padx=8, pady=6)
+            row.pack(fill=tk.X, padx=8, pady=3)
+
+            # Thumbnail
+            try:
+                from PIL import Image, ImageTk as ITk
+                img = Image.open(entry.thumbnail_path)
+                img.thumbnail((100, 75), Image.LANCZOS)
+                photo = ITk.PhotoImage(img)
+                win._thumb_refs.append(photo)
+                tk.Label(row, image=photo, bg="#f1f5f9").pack(side=tk.LEFT, padx=(0, 10))
+            except Exception:
+                tk.Label(row, text="[no thumb]", font=FONT_TINY, bg="#f1f5f9", fg=FG_MUTED).pack(side=tk.LEFT, padx=(0, 10))
+
+            # Info
+            info_frame = tk.Frame(row, bg="#f1f5f9")
+            info_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Label(info_frame, text=entry.short_prompt, font=FONT_SMALL, bg="#f1f5f9", fg=FG_BODY,
+                     anchor=tk.W, wraplength=400).pack(anchor=tk.W)
+            tk.Label(info_frame, text=entry.time_str, font=FONT_TINY, bg="#f1f5f9", fg=FG_MUTED,
+                     anchor=tk.W).pack(anchor=tk.W)
+
+            # Load prompt button
+            prompt_text = entry.prompt
+            tk.Button(row, text="Use Prompt", font=FONT_TINY, bg=ACCENT, fg="white",
+                      relief=tk.FLAT, padx=6, pady=2, cursor="hand2",
+                      command=lambda p=prompt_text: (self._insert_example(p), win.destroy())
+                      ).pack(side=tk.RIGHT, padx=4)
 
     # ── Prompt helpers ───────────────────────────────────────────────
 
@@ -410,14 +509,18 @@ class BlenderMCPApp(tk.Tk):
 
     def _check_blender_connection(self) -> None:
         def _check() -> None:
-            info = get_scene_info()
-            self._blender_ok = info.ok
-            color = "#22c55e" if info.ok else "#ef4444"
-            text = "\u25cf Blender Connected" if info.ok else "\u25cf Blender Disconnected"
-            self.after(0, lambda: (self._conn_var.set(text), self._conn_label.configure(fg=color)))
+            ok = ping_blender()
+            self._blender_ok = ok
+            self._update_connection_ui(ok)
             # Re-check every 30 seconds
             self.after(30000, self._check_blender_connection)
         threading.Thread(target=_check, daemon=True).start()
+
+    def _update_connection_ui(self, connected: bool) -> None:
+        """Update the connection indicator label (thread-safe)."""
+        color = "#22c55e" if connected else "#ef4444"
+        text = "\u25cf Blender Connected" if connected else "\u25cf Blender Disconnected"
+        self.after(0, lambda: (self._conn_var.set(text), self._conn_label.configure(fg=color)))
 
     # ── Generation ───────────────────────────────────────────────────
 
@@ -465,6 +568,12 @@ class BlenderMCPApp(tk.Tk):
                     scene_context = info.stdout
                     self._log_msg(f"  Scene context: {len(scene_context)} chars", "info")
 
+            # Step 0.5: Enrich prompt (PubChem, etc.)
+            enriched_prompt, enrich_log = enrich_prompt(prompt)
+            if enrich_log:
+                self._log_msg(f"Prompt enriched: {enrich_log}", "success")
+                prompt = enriched_prompt
+
             # Step 1: Generate
             code = self._step_generate(prompt, scene_context)
             if code is None or self._cancelled():
@@ -488,6 +597,10 @@ class BlenderMCPApp(tk.Tk):
             self._set_status("Done!")
             self.after(0, lambda: self.title("BlenderMCP — Scene Ready"))
             self._log_msg("Scene complete!", "success")
+
+            # Pipeline succeeded → Blender is definitely connected
+            self._blender_ok = True
+            self._update_connection_ui(True)
 
             # Save to history
             self._history = save_prompt(prompt, self._history)
@@ -527,13 +640,15 @@ class BlenderMCPApp(tk.Tk):
             self._log_msg(f"Generating bpy code{label}...", "step")
 
             try:
-                code = generate_bpy_code(prompt, feedback=feedback, scene_context=scene_context)
+                code, was_cached = generate_bpy_code(prompt, feedback=feedback, scene_context=scene_context)
             except Exception as e:
                 self._log_error(str(e))
                 self._set_pipeline_step(0, "fail")
                 self._set_status("LLM error")
                 return None
 
+            if was_cached:
+                self._log_msg("Using cached code (saved API call)", "success")
             self._log_msg(f"Generated {len(code.splitlines())} lines", "info")
             self._set_pipeline_step(0, "done")
 
@@ -597,7 +712,7 @@ class BlenderMCPApp(tk.Tk):
             self._log_msg("Regenerating with error feedback...", "info")
 
             try:
-                current_code = generate_bpy_code(prompt, feedback=feedback, scene_context=scene_context)
+                current_code, _ = generate_bpy_code(prompt, feedback=feedback, scene_context=scene_context)
             except Exception as e:
                 self._log_error(str(e))
                 break
@@ -625,10 +740,11 @@ class BlenderMCPApp(tk.Tk):
     def _step_scene_setup(self) -> None:
         self._set_pipeline_step(3, "active")
         renderer = self._renderer_var.get()
-        self._set_status(f"Setting up camera and lighting ({renderer})...")
-        self._log_msg(f"Adding camera, lights, ground ({renderer.upper()})...", "step")
+        quality = self._quality_var.get()
+        self._set_status(f"Setting up camera and lighting ({renderer}, {quality})...")
+        self._log_msg(f"Adding camera, lights, ground ({renderer.upper()}, {quality})...", "step")
 
-        cam_code = generate_camera_lighting_code(renderer=renderer)
+        cam_code = generate_camera_lighting_code(renderer=renderer, quality=quality)
         result = execute_code(cam_code)
 
         if result.ok:
@@ -655,6 +771,10 @@ class BlenderMCPApp(tk.Tk):
             self._set_pipeline_step(4, "done")
             self.after(0, self._render_status.set, f"{w} x {h}")
             self.after(0, self._load_and_display_preview)
+            # Auto-save to render history
+            entry = save_render(self._preview_path, self._current_prompt)
+            if entry:
+                self._log_msg(f"Saved to history", "info")
         else:
             self._log_error(result.stderr or "Render failed")
             self._set_pipeline_step(4, "fail")

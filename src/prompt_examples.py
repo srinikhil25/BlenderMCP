@@ -21,11 +21,20 @@ EXAMPLES: dict[str, list[str]] = {
         "A lighthouse on a rocky cliff overlooking the sea",
         "A low-poly mountain landscape with pine trees and a cabin",
     ],
-    "Chemistry": [
-        "A water molecule H2O in ball-and-stick model with red oxygen and white hydrogen",
-        "A methane molecule CH4 in tetrahedral ball-and-stick model",
-        "A DNA double helix with two colored strands",
+    "Chemistry (auto-enriched via PubChem)": [
+        "A caffeine molecule in ball-and-stick model",
+        "A water molecule H2O in ball-and-stick model",
+        "A benzene molecule in ball-and-stick model",
+        "An aspirin molecule in ball-and-stick model",
+        "A dopamine molecule in ball-and-stick model",
+        "An ethanol molecule in ball-and-stick model",
+        "A glucose molecule in ball-and-stick model",
+    ],
+    "Lab & Science": [
         "A chemistry lab with Erlenmeyer flask, test tubes, and Bunsen burner",
+        "A microscope on a lab table with glass slides",
+        "A DNA double helix with two colored strands",
+        "A solar system model with planets orbiting the sun",
     ],
 }
 

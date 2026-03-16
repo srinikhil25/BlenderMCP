@@ -8,13 +8,24 @@ Supports both Cycles (photorealistic) and EEVEE (fast preview).
 from __future__ import annotations
 
 
-def generate_camera_lighting_code(renderer: str = "cycles") -> str:
+def generate_camera_lighting_code(renderer: str = "cycles", quality: str = "standard") -> str:
     """Return a bpy script string that sets up camera, lights, ground, and render.
 
     Args:
         renderer: 'cycles' for photorealistic, 'eevee' for fast preview.
+        quality: 'draft', 'standard', or 'high' — controls samples, bounces, etc.
     """
-    return _SETUP_SCRIPT.replace("__RENDERER__", renderer)
+    from src.config import QUALITY_PRESETS
+    preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["standard"])
+    code = _SETUP_SCRIPT.replace("__RENDERER__", renderer)
+    code = code.replace("__SAMPLES__", str(preset["samples"]))
+    code = code.replace("__PREVIEW_SAMPLES__", str(max(preset["samples"] // 4, 16)))
+    code = code.replace("__BOUNCES__", str(preset["bounces"]))
+    code = code.replace("__DIFFUSE_BOUNCES__", str(preset["bounces"] // 2))
+    code = code.replace("__GLOSSY_BOUNCES__", str(preset["bounces"] // 2))
+    code = code.replace("__DENOISER__", str(preset["denoiser"]))
+    code = code.replace("__RESOLUTION_PCT__", str(preset["resolution_pct"]))
+    return code
 
 
 _SETUP_SCRIPT = '''\
@@ -139,23 +150,42 @@ def setup_scene():
             pass
 
         # =========================================================
-        # CAMERA — adaptive framing
+        # CAMERA — adaptive framing (handles objects in any quadrant)
         # =========================================================
-        dist_mult = 1.8 if diag > 1.0 else 2.5
+        # Compute max extent from center to ensure ALL objects are visible
+        if scene_coords:
+            max_extent = max(
+                max(abs(c.x - center.x) for c in scene_coords),
+                max(abs(c.y - center.y) for c in scene_coords),
+                max(abs(c.z - center.z) for c in scene_coords),
+            )
+        else:
+            max_extent = diag / 2
+
+        # Camera distance based on the larger of diag or max single-axis extent
+        # This ensures objects far from center in any direction are captured
+        cam_radius = max(diag, max_extent * 2.0)
+        dist_mult = 1.8 if cam_radius > 1.0 else 2.5
+        cam_dist = cam_radius * dist_mult
+
+        # Position camera at 45° azimuth, 30° elevation from center
+        # Using spherical coordinates so it works regardless of where objects are
+        azimuth = math.radians(45)
+        elevation = math.radians(30)
         cam_offset = mathutils.Vector((
-            diag * dist_mult * 0.7,
-            -diag * dist_mult * 0.7,
-            diag * dist_mult * 0.5
+            cam_dist * math.cos(elevation) * math.cos(azimuth),
+            cam_dist * math.cos(elevation) * math.sin(azimuth),
+            cam_dist * math.sin(elevation),
         ))
         cam_location = center + cam_offset
         bpy.ops.object.camera_add(location=cam_location)
         cam = bpy.context.active_object
         cam.name = "Camera"
-        cam.data.lens = 85 if diag < 1.0 else 50
+        cam.data.lens = 85 if cam_radius < 1.0 else 50
 
         # Depth of field for photorealism (subtle)
         cam.data.dof.use_dof = True
-        cam.data.dof.aperture_fstop = 5.6 if diag > 1.0 else 2.8
+        cam.data.dof.aperture_fstop = 5.6 if cam_radius > 1.0 else 2.8
         cam.data.dof.focus_distance = (cam_location - center).length
 
         # Track-to constraint
@@ -234,21 +264,21 @@ def setup_scene():
                 except Exception:
                     scene.cycles.device = 'CPU'
 
-            # Quality settings (balanced for speed + quality)
-            scene.cycles.samples = 128
-            scene.cycles.preview_samples = 32
-            scene.cycles.use_denoising = True
+            # Quality settings (from preset: draft / standard / high)
+            scene.cycles.samples = __SAMPLES__
+            scene.cycles.preview_samples = __PREVIEW_SAMPLES__
+            scene.cycles.use_denoising = __DENOISER__
             try:
                 scene.cycles.denoiser = 'OPENIMAGEDENOISE'
             except Exception:
                 pass
 
             # Light paths for realism
-            scene.cycles.max_bounces = 8
-            scene.cycles.diffuse_bounces = 4
-            scene.cycles.glossy_bounces = 4
-            scene.cycles.transmission_bounces = 8
-            scene.cycles.transparent_max_bounces = 8
+            scene.cycles.max_bounces = __BOUNCES__
+            scene.cycles.diffuse_bounces = __DIFFUSE_BOUNCES__
+            scene.cycles.glossy_bounces = __GLOSSY_BOUNCES__
+            scene.cycles.transmission_bounces = __BOUNCES__
+            scene.cycles.transparent_max_bounces = __BOUNCES__
             scene.cycles.caustics_reflective = False
             scene.cycles.caustics_refractive = False
 
@@ -276,7 +306,7 @@ def setup_scene():
         # Resolution
         scene.render.resolution_x = 1920
         scene.render.resolution_y = 1080
-        scene.render.resolution_percentage = 100
+        scene.render.resolution_percentage = __RESOLUTION_PCT__
 
         # Color management — Filmic for photorealism
         try:

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 
 import src.config as cfg
+from src.code_cache import get_cached, save_to_cache
 
 SYSTEM_PROMPT = """\
 You are a Blender 5.1 Python expert specializing in photorealistic 3D scenes.
@@ -165,6 +167,7 @@ CRITICAL BLENDER 5.1 RULES:
 14. DO NOT import os, sys, subprocess, or use eval/exec/open.
 15. For positioning: cube size=1 means 1m each side. Location is CENTER. Cube at z=0.5, size=1 sits on ground.
 16. NEVER pass execution context as positional arg to bpy.ops calls.
+17. Wave Texture node: wave_type ONLY accepts 'BANDS' or 'RINGS' (NOT 'SAW'). wave_profile ONLY accepts 'SIN' or 'SAW'. Do NOT confuse these two properties.
 
 MATERIAL GUIDE (use realistic PBR values):
 - Wood: create_wood_material("Oak", (0.45, 0.25, 0.1), roughness=0.7)
@@ -386,7 +389,9 @@ Output the COMPLETE script inside ```python fences.
 """
 
 
-def generate_bpy_code(prompt: str, feedback: str = "", scene_context: str = "") -> str:
+def generate_bpy_code(
+    prompt: str, feedback: str = "", scene_context: str = "",
+) -> tuple[str, bool]:
     """Generate bpy Python code for the given prompt.
 
     Args:
@@ -395,12 +400,24 @@ def generate_bpy_code(prompt: str, feedback: str = "", scene_context: str = "") 
         scene_context: Optional current scene state (for modify mode).
 
     Returns:
-        Extracted Python code string.
+        Tuple of (code_string, was_cached).
     """
+    # Check cache (skip if retrying with feedback or modifying)
+    if not feedback and not scene_context:
+        cached = get_cached(prompt)
+        if cached:
+            return cached, True
+
     if cfg.LLM_PROVIDER == "gemini":
-        return _generate_gemini(prompt, feedback, scene_context)
+        code = _generate_gemini(prompt, feedback, scene_context)
     else:
-        return _generate_ollama(prompt, feedback, scene_context)
+        code = _generate_ollama(prompt, feedback, scene_context)
+
+    # Save to cache (only first successful generation, not retries/modify)
+    if not feedback and not scene_context:
+        save_to_cache(prompt, code)
+
+    return code, False
 
 
 def _build_user_message(prompt: str, feedback: str, scene_context: str) -> str:
@@ -433,17 +450,40 @@ def _generate_gemini(prompt: str, feedback: str = "", scene_context: str = "") -
         )
 
     client = genai.Client(api_key=api_key)
-
     user_msg = _build_user_message(prompt, feedback, scene_context)
-    response = client.models.generate_content(
-        model=cfg.GEMINI_MODEL,
-        contents=user_msg,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-        ),
-    )
-    raw = response.text
-    return _extract_code(raw)
+
+    # Run with timeout
+    result_container: list = []
+    error_container: list = []
+
+    def _call() -> None:
+        try:
+            response = client.models.generate_content(
+                model=cfg.GEMINI_MODEL,
+                contents=user_msg,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                ),
+            )
+            result_container.append(response.text)
+        except Exception as e:
+            error_container.append(e)
+
+    thread = threading.Thread(target=_call, daemon=True)
+    thread.start()
+    thread.join(timeout=cfg.LLM_TIMEOUT)
+
+    if thread.is_alive():
+        raise RuntimeError(
+            f"Gemini API timed out after {cfg.LLM_TIMEOUT}s. "
+            "Try a simpler prompt or check your internet connection."
+        )
+    if error_container:
+        raise error_container[0]
+    if not result_container:
+        raise RuntimeError("Gemini returned no response.")
+
+    return _extract_code(result_container[0])
 
 
 def _generate_ollama(prompt: str, feedback: str = "", scene_context: str = "") -> str:
@@ -457,14 +497,36 @@ def _generate_ollama(prompt: str, feedback: str = "", scene_context: str = "") -
         {"role": "user", "content": user_msg},
     ]
 
-    response = ollama.chat(
-        model=cfg.OLLAMA_MODEL,
-        messages=messages,
-        options={"num_ctx": cfg.OLLAMA_NUM_CTX},
-    )
+    # Run with timeout
+    result_container: list = []
+    error_container: list = []
 
-    raw = response["message"]["content"]
-    return _extract_code(raw)
+    def _call() -> None:
+        try:
+            response = ollama.chat(
+                model=cfg.OLLAMA_MODEL,
+                messages=messages,
+                options={"num_ctx": cfg.OLLAMA_NUM_CTX},
+            )
+            result_container.append(response["message"]["content"])
+        except Exception as e:
+            error_container.append(e)
+
+    thread = threading.Thread(target=_call, daemon=True)
+    thread.start()
+    thread.join(timeout=cfg.LLM_TIMEOUT)
+
+    if thread.is_alive():
+        raise RuntimeError(
+            f"Ollama timed out after {cfg.LLM_TIMEOUT}s. "
+            "The model may be too large for your hardware."
+        )
+    if error_container:
+        raise error_container[0]
+    if not result_container:
+        raise RuntimeError("Ollama returned no response.")
+
+    return _extract_code(result_container[0])
 
 
 def _extract_code(text: str) -> str:

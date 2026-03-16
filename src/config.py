@@ -50,6 +50,19 @@ OLLAMA_NUM_CTX = _saved.get("ollama_num_ctx", 8192)
 # Retry settings
 MAX_RETRIES = _saved.get("max_retries", 2)
 
+# Timeouts (seconds)
+LLM_TIMEOUT = 120         # Max wait for LLM API response
+BLENDER_EXEC_TIMEOUT = 60  # Max wait for code execution in Blender
+RENDER_TIMEOUT = 300       # Max wait for render (complex scenes take time)
+
+# Render quality presets
+RENDER_QUALITY = _saved.get("render_quality", "standard")
+QUALITY_PRESETS = {
+    "draft":    {"samples": 32,  "bounces": 4,  "resolution_pct": 75,  "denoiser": True},
+    "standard": {"samples": 128, "bounces": 8,  "resolution_pct": 100, "denoiser": True},
+    "high":     {"samples": 512, "bounces": 12, "resolution_pct": 100, "denoiser": True},
+}
+
 # Blender MCP command
 BLENDER_MCP_CMD = "cmd"
 BLENDER_MCP_ARGS = ["/c", "uvx", "blender-mcp"]

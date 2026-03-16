@@ -95,7 +95,12 @@ _ERROR_MAP: List[Tuple[str, FriendlyError]] = [
         "This will auto-retry with the error feedback.",
     )),
 
-    # Timeout
+    # Timeouts
+    ("timed out after", FriendlyError(
+        "Timeout",
+        "The operation exceeded its time limit.",
+        "Try a simpler prompt, use Draft quality, or check your connection.",
+    )),
     ("timeout", FriendlyError(
         "Timeout",
         "The operation took too long.",

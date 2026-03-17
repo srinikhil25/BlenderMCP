@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import tkinter as tk
-from tkinter import filedialog, scrolledtext
+from tkinter import filedialog, scrolledtext, ttk
 from pathlib import Path
 
 import src.config as cfg
 from src.obsidian import config as obs_cfg
-from src.obsidian.llm import generate_note
+from src.obsidian.llm import generate_note, generate_topic_map, generate_cluster_note
 from src.obsidian.vault import (
     get_vault_path, list_notes, list_note_titles, read_note, write_note,
     extract_title_from_markdown, slugify, search_notes,
 )
+from src.obsidian.graph import GraphCanvas
 from src.obsidian.examples import EXAMPLES
 from src.error_messages import get_friendly_error
 
@@ -44,6 +46,7 @@ FONT_SMALL = ("Segoe UI", 9)
 FONT_TINY = ("Segoe UI", 8)
 
 PIPELINE_STEPS = ["Generate", "Process", "Save"]
+CLUSTER_STEPS = ["Map", "Generate", "Link", "Save"]
 
 
 class ObsidianMCPApp(tk.Tk):
@@ -59,6 +62,8 @@ class ObsidianMCPApp(tk.Tk):
         self._cancel_event = threading.Event()
         self._current_prompt = ""
         self._current_note = ""
+        self._cluster_notes: list[dict] = []  # [{title, content, type}]
+        self._cluster_index = 0  # currently viewed note in cluster
 
         # Load settings
         saved = obs_cfg.load_settings()
@@ -154,6 +159,9 @@ class ObsidianMCPApp(tk.Tk):
         tk.Radiobutton(mode_frame, text="Modify", variable=self._mode_var, value="modify",
                         font=FONT_SMALL, bg=BG_LIGHT, fg=FG_BODY, selectcolor=BG_LIGHT,
                         activebackground=BG_LIGHT).pack(side=tk.LEFT)
+        tk.Radiobutton(mode_frame, text="Cluster", variable=self._mode_var, value="cluster",
+                        font=FONT_SMALL, bg=BG_LIGHT, fg="#7c3aed", selectcolor=BG_LIGHT,
+                        activebackground=BG_LIGHT).pack(side=tk.LEFT)
 
         # Template selector
         self._template_var = tk.StringVar(value="standard")
@@ -206,29 +214,76 @@ class ObsidianMCPApp(tk.Tk):
         self._log.tag_configure("step", foreground=ACCENT, font=("Consolas", 10, "bold"))
         self._log.tag_configure("info", foreground=FG_LOG)
 
-        # ── Right column: note preview ──
+        # ── Right column: tabbed Notebook ──
         right = tk.Frame(paned, bg=BG_PREVIEW, bd=1, relief=tk.SOLID)
         paned.add(right, minsize=350)
 
+        # Style the notebook tabs (dark theme)
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("Dark.TNotebook", background=BG_PREVIEW, borderwidth=0)
+        style.configure("Dark.TNotebook.Tab",
+                        background="#2d2640", foreground="#c4b5d0",
+                        padding=[12, 4], font=("Segoe UI", 9))
+        style.map("Dark.TNotebook.Tab",
+                  background=[("selected", "#7c3aed")],
+                  foreground=[("selected", "white")])
+
+        self._notebook = ttk.Notebook(right, style="Dark.TNotebook")
+        self._notebook.pack(fill=tk.BOTH, expand=True)
+
+        # ── Tab 1: Note Preview ──
+        preview_tab = tk.Frame(self._notebook, bg=BG_PREVIEW)
+        self._notebook.add(preview_tab, text="  Preview  ")
+
         # Preview header
-        prev_hdr = tk.Frame(right, bg="#1f1a2e")
+        prev_hdr = tk.Frame(preview_tab, bg="#1f1a2e")
         prev_hdr.pack(fill=tk.X)
-        tk.Label(prev_hdr, text="Note Preview", font=FONT_BODY, bg="#1f1a2e", fg="#c4b5d0").pack(side=tk.LEFT, padx=10, pady=6)
 
         self._note_status = tk.StringVar(value="No note yet")
-        tk.Label(prev_hdr, textvariable=self._note_status, font=FONT_TINY, bg="#1f1a2e", fg="#6b6580").pack(side=tk.LEFT, padx=4)
+        tk.Label(prev_hdr, textvariable=self._note_status, font=FONT_TINY, bg="#1f1a2e", fg="#6b6580").pack(side=tk.LEFT, padx=10, pady=6)
 
         # Copy note + Save buttons
-        tk.Button(prev_hdr, text="Save to Vault", font=FONT_TINY, bg="#1f1a2e", fg="#9b8fc4",
+        self._save_btn = tk.Button(prev_hdr, text="Save to Vault", font=FONT_TINY, bg="#1f1a2e", fg="#9b8fc4",
                   bd=0, padx=6, cursor="hand2", activebackground="#2d2640", activeforeground="#c4b5d0",
-                  command=self._save_to_vault).pack(side=tk.RIGHT, padx=(0, 10), pady=6)
+                  command=self._save_to_vault)
+        self._save_btn.pack(side=tk.RIGHT, padx=(0, 10), pady=6)
         tk.Button(prev_hdr, text="Copy Note", font=FONT_TINY, bg="#1f1a2e", fg="#9b8fc4",
                   bd=0, padx=6, cursor="hand2", activebackground="#2d2640", activeforeground="#c4b5d0",
                   command=self._copy_note).pack(side=tk.RIGHT, padx=4, pady=6)
 
+        # Cluster navigation bar (hidden by default)
+        self._cluster_nav = tk.Frame(preview_tab, bg="#251f38")
+        # NOT packed yet — shown only in cluster mode
+
+        self._cluster_prev_btn = tk.Button(
+            self._cluster_nav, text="\u25c0 Prev", font=FONT_TINY, bg="#251f38", fg="#9b8fc4",
+            bd=0, padx=8, cursor="hand2", activebackground="#2d2640",
+            command=lambda: self._navigate_cluster(-1),
+        )
+        self._cluster_prev_btn.pack(side=tk.LEFT, padx=6, pady=4)
+
+        self._cluster_title_var = tk.StringVar(value="")
+        tk.Label(self._cluster_nav, textvariable=self._cluster_title_var, font=FONT_SMALL,
+                 bg="#251f38", fg="#c084fc").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        self._cluster_next_btn = tk.Button(
+            self._cluster_nav, text="Next \u25b6", font=FONT_TINY, bg="#251f38", fg="#9b8fc4",
+            bd=0, padx=8, cursor="hand2", activebackground="#2d2640",
+            command=lambda: self._navigate_cluster(1),
+        )
+        self._cluster_next_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=4)
+
+        self._cluster_save_all_btn = tk.Button(
+            self._cluster_nav, text="Save All to Vault", font=FONT_TINY, bg="#7c3aed", fg="white",
+            bd=0, padx=8, pady=2, cursor="hand2", activebackground="#6d28d9",
+            command=self._save_cluster_to_vault,
+        )
+        self._cluster_save_all_btn.pack(side=tk.RIGHT, padx=4, pady=4)
+
         # Note preview text
         self._preview = scrolledtext.ScrolledText(
-            right, font=("Consolas", 11), bg=BG_PREVIEW, fg="#e2e0f0",
+            preview_tab, font=("Consolas", 11), bg=BG_PREVIEW, fg="#e2e0f0",
             insertbackground="#e2e0f0", relief=tk.FLAT, state=tk.DISABLED, wrap=tk.WORD,
         )
         self._preview.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -241,10 +296,47 @@ class ObsidianMCPApp(tk.Tk):
         self._preview.tag_configure("code", foreground="#fbbf24", background="#2d2640")
         self._preview.tag_configure("quote", foreground="#a78bfa", font=("Consolas", 11, "italic"))
 
+        # ── Tab 2: Graph View ──
+        graph_tab = tk.Frame(self._notebook, bg=BG_PREVIEW)
+        self._notebook.add(graph_tab, text="  Graph  ")
+
+        # Graph toolbar
+        graph_toolbar = tk.Frame(graph_tab, bg="#1f1a2e")
+        graph_toolbar.pack(fill=tk.X)
+        tk.Button(graph_toolbar, text="\u27f3 Refresh", font=FONT_TINY,
+                  bg="#1f1a2e", fg="#9b8fc4", bd=0, padx=8, pady=4,
+                  cursor="hand2", activebackground="#2d2640",
+                  command=self._refresh_graph).pack(side=tk.LEFT, padx=6)
+        tk.Button(graph_toolbar, text="\u2302 Fit View", font=FONT_TINY,
+                  bg="#1f1a2e", fg="#9b8fc4", bd=0, padx=8, pady=4,
+                  cursor="hand2", activebackground="#2d2640",
+                  command=self._fit_graph_view).pack(side=tk.LEFT)
+
+        # Graph legend
+        legend = tk.Frame(graph_toolbar, bg="#1f1a2e")
+        legend.pack(side=tk.RIGHT, padx=8, pady=4)
+        for label, color in [("Hub", "#c084fc"), ("Connected", "#38bdf8"),
+                             ("Leaf", "#22c55e"), ("Ghost", "#4b4560")]:
+            tk.Label(legend, text="\u25cf", font=("Segoe UI", 8), bg="#1f1a2e", fg=color).pack(side=tk.LEFT, padx=(4, 0))
+            tk.Label(legend, text=label, font=("Segoe UI", 7), bg="#1f1a2e", fg="#6b6580").pack(side=tk.LEFT, padx=(0, 4))
+
+        # Graph canvas
+        self._graph = GraphCanvas(graph_tab, on_node_click=self._on_graph_node_click)
+        self._graph.pack(fill=tk.BOTH, expand=True)
+
+        # ── Tab 3: Vault Explorer ──
+        explorer_tab = tk.Frame(self._notebook, bg=BG_PREVIEW)
+        self._notebook.add(explorer_tab, text="  Explorer  ")
+        self._build_explorer(explorer_tab)
+
+        # Auto-refresh graph when tab is selected
+        self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         # ── Keyboard shortcuts ──
         self.bind("<Control-Return>", lambda e: self._on_generate())
         self.bind("<Control-l>", lambda e: self._clear_log())
         self.bind("<Escape>", lambda e: self._on_cancel())
+        self.bind("<Control-g>", lambda e: self._switch_to_graph())
 
     # ── Vault check ──────────────────────────────────────────────────
 
@@ -257,6 +349,270 @@ class ObsidianMCPApp(tk.Tk):
         else:
             self._vault_var.set("\u25cf No vault — set in Settings")
             self._vault_label.configure(fg="#ef4444")
+
+    # ── Vault Explorer ────────────────────────────────────────────────
+
+    def _build_explorer(self, parent: tk.Frame) -> None:
+        """Build the vault explorer tab content."""
+        # Search bar
+        search_frame = tk.Frame(parent, bg="#1f1a2e")
+        search_frame.pack(fill=tk.X)
+        tk.Label(search_frame, text="\U0001f50d", font=FONT_SMALL, bg="#1f1a2e", fg="#6b6580").pack(side=tk.LEFT, padx=(8, 4), pady=4)
+        self._explorer_search_var = tk.StringVar()
+        self._explorer_search = tk.Entry(
+            search_frame, textvariable=self._explorer_search_var,
+            font=FONT_SMALL, bg="#2d2640", fg="#e2e0f0",
+            insertbackground="#e2e0f0", relief=tk.FLAT, bd=0,
+        )
+        self._explorer_search.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, pady=4, ipady=2)
+        self._explorer_search_var.trace_add("write", lambda *_: self._filter_explorer())
+
+        tk.Button(search_frame, text="\u27f3", font=FONT_TINY,
+                  bg="#1f1a2e", fg="#9b8fc4", bd=0, padx=6,
+                  cursor="hand2", activebackground="#2d2640",
+                  command=self._refresh_explorer).pack(side=tk.RIGHT, padx=4, pady=4)
+
+        # Note list with Treeview
+        tree_frame = tk.Frame(parent, bg=BG_PREVIEW)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        style = ttk.Style()
+        style.configure("Explorer.Treeview",
+                        background="#1a1726", foreground="#e2e0f0",
+                        fieldbackground="#1a1726", borderwidth=0,
+                        font=("Segoe UI", 9), rowheight=24)
+        style.configure("Explorer.Treeview.Heading",
+                        background="#2d2640", foreground="#c4b5d0",
+                        font=("Segoe UI", 8, "bold"))
+        style.map("Explorer.Treeview",
+                  background=[("selected", "#7c3aed")],
+                  foreground=[("selected", "white")])
+
+        columns = ("links", "tags")
+        self._explorer_tree = ttk.Treeview(
+            tree_frame, style="Explorer.Treeview",
+            columns=columns, show="tree headings", selectmode="browse",
+        )
+        self._explorer_tree.heading("#0", text="Note", anchor=tk.W)
+        self._explorer_tree.heading("links", text="Links", anchor=tk.CENTER)
+        self._explorer_tree.heading("tags", text="Tags", anchor=tk.W)
+        self._explorer_tree.column("#0", minwidth=150, width=250)
+        self._explorer_tree.column("links", minwidth=40, width=50, anchor=tk.CENTER)
+        self._explorer_tree.column("tags", minwidth=100, width=150)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._explorer_tree.yview)
+        self._explorer_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._explorer_tree.pack(fill=tk.BOTH, expand=True)
+
+        self._explorer_tree.bind("<<TreeviewSelect>>", self._on_explorer_select)
+        self._explorer_tree.bind("<Double-1>", self._on_explorer_double_click)
+
+        # Note info bar at bottom
+        self._explorer_info_var = tk.StringVar(value="Select a note to preview")
+        tk.Label(parent, textvariable=self._explorer_info_var, font=FONT_TINY,
+                 bg="#1a1726", fg="#6b6580", anchor=tk.W, padx=8, pady=3).pack(fill=tk.X)
+
+        # Store all notes data for filtering
+        self._explorer_notes_data: list[dict] = []
+
+    def _refresh_explorer(self) -> None:
+        """Reload the vault explorer note list."""
+        vault = get_vault_path()
+        if not vault:
+            self._explorer_info_var.set("No vault configured — set in Settings")
+            return
+
+        self._explorer_tree.delete(*self._explorer_tree.get_children())
+        self._explorer_notes_data.clear()
+
+        # Build folder structure
+        folders: dict[str, str] = {}  # folder_path -> treeview_id
+
+        for note_path in list_notes():
+            full = vault / note_path
+            parts = Path(note_path).parts
+            title = Path(note_path).stem
+
+            # Read note metadata
+            content = ""
+            try:
+                content = full.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+            links = re.findall(r'\[\[(.+?)\]\]', content)
+            tags = re.findall(r'#([\w-]+)', content)
+
+            # Create folder nodes
+            parent_id = ""
+            if len(parts) > 1:
+                folder_path = str(Path(*parts[:-1]))
+                if folder_path not in folders:
+                    # Create nested folders
+                    accumulated = ""
+                    for folder_part in parts[:-1]:
+                        accumulated = f"{accumulated}/{folder_part}" if accumulated else folder_part
+                        if accumulated not in folders:
+                            parent_folder = folders.get(str(Path(*accumulated.split("/")[:-1])), "") if "/" in accumulated else ""
+                            folders[accumulated] = self._explorer_tree.insert(
+                                parent_folder, tk.END,
+                                text=f"\U0001f4c1 {folder_part}",
+                                values=("", ""),
+                                open=True,
+                            )
+                parent_id = folders.get(folder_path, "")
+
+            # Insert note
+            item_id = self._explorer_tree.insert(
+                parent_id, tk.END,
+                text=f"\U0001f4c4 {title}",
+                values=(str(len(links)), ", ".join(tags[:3])),
+            )
+
+            self._explorer_notes_data.append({
+                "path": note_path,
+                "title": title,
+                "item_id": item_id,
+                "link_count": len(links),
+                "tags": tags,
+            })
+
+        total = len(self._explorer_notes_data)
+        self._explorer_info_var.set(f"{total} notes in vault")
+
+    def _filter_explorer(self) -> None:
+        """Filter the explorer tree based on search text."""
+        query = self._explorer_search_var.get().strip().lower()
+        if not query:
+            # Show all
+            for data in self._explorer_notes_data:
+                # Treeview doesn't have show/hide per item easily,
+                # so we just re-tag. For simplicity, refresh the list.
+                pass
+            self._refresh_explorer()
+            return
+
+        # Simple approach: rebuild tree with only matching notes
+        vault = get_vault_path()
+        if not vault:
+            return
+
+        self._explorer_tree.delete(*self._explorer_tree.get_children())
+        count = 0
+        for data in self._explorer_notes_data:
+            title_match = query in data["title"].lower()
+            tag_match = any(query in t.lower() for t in data["tags"])
+            if title_match or tag_match:
+                self._explorer_tree.insert(
+                    "", tk.END,
+                    text=f"\U0001f4c4 {data['title']}",
+                    values=(str(data["link_count"]), ", ".join(data["tags"][:3])),
+                    tags=(data["path"],),
+                )
+                count += 1
+
+        self._explorer_info_var.set(f"{count} notes matching '{query}'")
+
+    def _on_explorer_select(self, event: tk.Event) -> None:
+        """Load the selected note into the preview."""
+        sel = self._explorer_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        text = self._explorer_tree.item(item, "text")
+        if text.startswith("\U0001f4c1"):  # folder, skip
+            return
+
+        # Find the note path
+        title = text.replace("\U0001f4c4 ", "")
+        for data in self._explorer_notes_data:
+            if data["title"] == title:
+                content = read_note(data["path"])
+                if content:
+                    self._current_note = content
+                    self._notebook.select(0)  # Switch to Preview tab
+                    self._display_note(content)
+                    self._explorer_info_var.set(f"Viewing: {data['path']}")
+                break
+
+    def _on_explorer_double_click(self, event: tk.Event) -> None:
+        """Load note into prompt for modification."""
+        sel = self._explorer_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        text = self._explorer_tree.item(item, "text")
+        if text.startswith("\U0001f4c1"):
+            return
+
+        title = text.replace("\U0001f4c4 ", "")
+        for data in self._explorer_notes_data:
+            if data["title"] == title:
+                content = read_note(data["path"])
+                if content:
+                    self._current_note = content
+                    self._mode_var.set("modify")
+                    self._notebook.select(0)
+                    self._display_note(content)
+                    self._prompt.delete("1.0", tk.END)
+                    self._prompt.insert("1.0", f"Enhance the note about {title}")
+                    self._log_msg(f"Loaded '{title}' for modification", "info")
+                    self._explorer_info_var.set(f"Editing: {data['path']} (double-click loaded)")
+                break
+
+    # ── Graph View ────────────────────────────────────────────────────
+
+    def _refresh_graph(self) -> None:
+        """Reload the knowledge graph from vault."""
+        vault = get_vault_path()
+        if not vault:
+            self._log_msg("No vault configured for graph view.", "error")
+            return
+
+        self._graph.load_vault(vault)
+        self._log_msg("Graph refreshed from vault", "info")
+
+    def _fit_graph_view(self) -> None:
+        """Reset graph zoom and pan to fit all nodes."""
+        self._graph._scale = 1.0
+        self._graph._offset_x = 0.0
+        self._graph._offset_y = 0.0
+        self._graph._render()
+
+    def _on_graph_node_click(self, title: str, path: str) -> None:
+        """Handle clicking a node in the graph — load note into preview."""
+        if path:  # real note (not ghost)
+            content = read_note(path)
+            if content:
+                self._current_note = content
+                self._notebook.select(0)  # Switch to Preview tab
+                self._display_note(content)
+                self._log_msg(f"Graph: loaded '{title}'", "info")
+        else:
+            # Ghost node — offer to create it
+            self._prompt.delete("1.0", tk.END)
+            self._prompt.insert("1.0", f"Create a note about: {title}")
+            self._mode_var.set("new")
+            self._notebook.select(0)
+            self._log_msg(f"Graph: '{title}' is a ghost node (not yet created). Prompt pre-filled.", "info")
+
+    def _switch_to_graph(self) -> None:
+        """Switch to graph tab (Ctrl+G shortcut)."""
+        self._notebook.select(1)
+
+    def _on_tab_changed(self, event: tk.Event) -> None:
+        """Handle notebook tab switches."""
+        tab_idx = self._notebook.index(self._notebook.select())
+        if tab_idx == 1:  # Graph tab
+            # Auto-load graph if vault is set and graph is empty
+            vault = get_vault_path()
+            if vault and not self._graph._nodes:
+                self._refresh_graph()
+        elif tab_idx == 2:  # Explorer tab
+            vault = get_vault_path()
+            if vault and not self._explorer_notes_data:
+                self._refresh_explorer()
 
     # ── Settings ─────────────────────────────────────────────────────
 
@@ -364,8 +720,15 @@ class ObsidianMCPApp(tk.Tk):
         self._gen_btn.configure(text="Cancel", bg=STEP_FAIL, command=self._on_cancel)
         self._reset_progress()
         self._set_status("Starting...")
-        self.title("ObsidianMCP \u2014 Generating...")
-        threading.Thread(target=self._run_pipeline, args=(prompt,), daemon=True).start()
+
+        if self._mode_var.get() == "cluster":
+            self.title("ObsidianMCP \u2014 Building Cluster...")
+            self._show_cluster_steps()
+            threading.Thread(target=self._run_cluster_pipeline, args=(prompt,), daemon=True).start()
+        else:
+            self.title("ObsidianMCP \u2014 Generating...")
+            self._show_single_steps()
+            threading.Thread(target=self._run_pipeline, args=(prompt,), daemon=True).start()
 
     def _on_cancel(self) -> None:
         if self._generating:
@@ -426,7 +789,6 @@ class ObsidianMCPApp(tk.Tk):
             self._log_msg(f"  Title: {title}", "info")
 
             # Count wiki-links and tags
-            import re
             links = re.findall(r'\[\[(.+?)\]\]', note)
             tags = re.findall(r'#([\w-]+)', note)
             if links:
@@ -457,6 +819,268 @@ class ObsidianMCPApp(tk.Tk):
     def _restore_generate_btn(self) -> None:
         self._gen_btn.configure(text="Generate Note", bg=ACCENT, command=self._on_generate)
 
+    # ── Pipeline step labels ─────────────────────────────────────────
+
+    def _show_single_steps(self) -> None:
+        """Switch progress bar to single-note pipeline steps."""
+        self._rebuild_step_labels(PIPELINE_STEPS)
+        self.after(0, lambda: self._cluster_nav.pack_forget())
+
+    def _show_cluster_steps(self) -> None:
+        """Switch progress bar to cluster pipeline steps."""
+        self._rebuild_step_labels(CLUSTER_STEPS)
+
+    def _rebuild_step_labels(self, steps: list[str]) -> None:
+        """Rebuild the step label widgets for a different pipeline."""
+        parent = self._step_labels[0].master if self._step_labels else None
+        if not parent:
+            return
+        for child in parent.winfo_children():
+            child.destroy()
+        self._step_labels.clear()
+        for i, name in enumerate(steps):
+            if i > 0:
+                tk.Label(parent, text="\u2192", font=FONT_TINY, bg=BG_LIGHT, fg="#9b8fc4").pack(side=tk.LEFT, padx=2)
+            lbl = tk.Label(parent, text=name, font=FONT_TINY, bg="#e8e4f0", fg=STEP_PENDING,
+                           padx=6, pady=1, relief=tk.FLAT)
+            lbl.pack(side=tk.LEFT, padx=1)
+            self._step_labels.append(lbl)
+
+    # ── Cluster pipeline ─────────────────────────────────────────────
+
+    def _run_cluster_pipeline(self, topic: str) -> None:
+        """Generate a full topic cluster: map → notes → display."""
+        try:
+            # Step 1: Generate topic map
+            self._set_pipeline_step(0, "active")
+            self._set_status("Mapping subtopics...")
+            self._log_msg("Building topic map...", "step")
+
+            try:
+                topic_map = generate_topic_map(topic)
+            except Exception as e:
+                self._log_error(str(e))
+                self._set_pipeline_step(0, "fail")
+                self._set_status("Mapping failed")
+                return
+
+            titles = [t["title"] for t in topic_map]
+            hub = topic_map[0]
+            self._log_msg(f"Topic map: {len(topic_map)} notes planned", "success")
+            for t in topic_map:
+                icon = {"hub": "\u2b50", "concept": "\u25cb", "example": "\u25a1", "reference": "\U0001f4d6"}.get(t["type"], "\u25cb")
+                self._log_msg(f"  {icon} {t['title']} — {t['description']}", "info")
+            self._set_pipeline_step(0, "done")
+
+            if self._cancel_event.is_set():
+                self._log_msg("Cancelled.", "info")
+                return
+
+            # Step 2: Generate each note
+            self._set_pipeline_step(1, "active")
+            self._set_status("Generating notes...")
+            self._log_msg("Generating cluster notes...", "step")
+
+            template = self._template_var.get()
+            vault_context = ""
+            vault = get_vault_path()
+            if vault:
+                existing = list_note_titles()[:50]
+                if existing:
+                    vault_context = ", ".join(existing)
+
+            cluster_notes: list[dict] = []
+            for i, t in enumerate(topic_map):
+                if self._cancel_event.is_set():
+                    self._log_msg("Cancelled.", "info")
+                    return
+
+                self._set_status(f"Generating {i + 1}/{len(topic_map)}: {t['title']}...")
+                self._log_msg(f"  [{i + 1}/{len(topic_map)}] {t['title']}...", "info")
+
+                try:
+                    content = generate_cluster_note(
+                        note_title=t["title"],
+                        note_description=t["description"],
+                        note_type=t["type"],
+                        hub_title=hub["title"],
+                        all_titles=titles,
+                        template=template,
+                        vault_context=vault_context,
+                    )
+                    cluster_notes.append({
+                        "title": t["title"],
+                        "content": content,
+                        "type": t["type"],
+                        "description": t["description"],
+                    })
+                    lines = len(content.splitlines())
+                    self._log_msg(f"    \u2713 {lines} lines", "success")
+                except Exception as e:
+                    self._log_msg(f"    \u2717 Failed: {e}", "error")
+                    # Continue with other notes even if one fails
+                    continue
+
+            if not cluster_notes:
+                self._log_msg("No notes generated. All failed.", "error")
+                self._set_pipeline_step(1, "fail")
+                return
+
+            self._log_msg(f"Generated {len(cluster_notes)}/{len(topic_map)} notes", "success")
+            self._set_pipeline_step(1, "done")
+
+            # Step 3: Link analysis
+            self._set_pipeline_step(2, "active")
+            self._set_status("Analyzing links...")
+            self._log_msg("Analyzing cross-links...", "step")
+
+            total_links = 0
+            internal_links = 0
+            for note in cluster_notes:
+                links = re.findall(r'\[\[(.+?)\]\]', note["content"])
+                total_links += len(links)
+                for link in links:
+                    if link in titles:
+                        internal_links += 1
+
+            self._log_msg(f"  Total wiki-links: {total_links}", "info")
+            self._log_msg(f"  Internal cluster links: {internal_links}", "info")
+            self._log_msg(f"  External links: {total_links - internal_links}", "info")
+            self._set_pipeline_step(2, "done")
+
+            # Step 4: Display
+            self._set_pipeline_step(3, "active")
+            self._set_status("Displaying cluster...")
+
+            self._cluster_notes = cluster_notes
+            self._cluster_index = 0
+            self._current_note = cluster_notes[0]["content"]
+
+            # Show cluster nav and display first note
+            self.after(0, self._show_cluster_nav)
+            self.after(0, lambda: self._display_note(cluster_notes[0]["content"]))
+
+            self._set_pipeline_step(3, "done")
+            self._set_status(f"Cluster ready! {len(cluster_notes)} notes")
+            self.after(0, lambda: self.title(f"ObsidianMCP \u2014 Cluster: {hub['title']}"))
+            self._log_msg(f"Cluster ready! Navigate with \u25c0 \u25b6 buttons.", "success")
+
+            # Auto-load cluster into graph view
+            self.after(100, lambda: self._graph.load_cluster(cluster_notes))
+            self._log_msg("Graph view updated with cluster topology.", "info")
+
+        except Exception as e:
+            self._log_error(str(e))
+            self._set_status("Error")
+        finally:
+            self._generating = False
+            self.after(0, self._restore_generate_btn)
+
+    # ── Cluster navigation ───────────────────────────────────────────
+
+    def _show_cluster_nav(self) -> None:
+        """Show the cluster navigation bar."""
+        self._cluster_nav.pack(fill=tk.X, before=self._preview)
+        self._update_cluster_nav()
+        # Update save button for cluster
+        self._save_btn.configure(text="Save This Note", command=self._save_to_vault)
+
+    def _hide_cluster_nav(self) -> None:
+        """Hide the cluster navigation bar."""
+        self._cluster_nav.pack_forget()
+        self._save_btn.configure(text="Save to Vault", command=self._save_to_vault)
+
+    def _update_cluster_nav(self) -> None:
+        """Update the cluster nav label and button states."""
+        if not self._cluster_notes:
+            return
+        idx = self._cluster_index
+        total = len(self._cluster_notes)
+        note = self._cluster_notes[idx]
+        icon = {"hub": "\u2b50", "concept": "\u25cb", "example": "\u25a1", "reference": "\U0001f4d6"}.get(note["type"], "\u25cb")
+        self._cluster_title_var.set(f"{icon} [{idx + 1}/{total}] {note['title']}")
+        self._cluster_prev_btn.configure(state=tk.NORMAL if idx > 0 else tk.DISABLED)
+        self._cluster_next_btn.configure(state=tk.NORMAL if idx < total - 1 else tk.DISABLED)
+
+    def _navigate_cluster(self, direction: int) -> None:
+        """Navigate to the previous/next note in the cluster."""
+        if not self._cluster_notes:
+            return
+        new_idx = self._cluster_index + direction
+        if 0 <= new_idx < len(self._cluster_notes):
+            self._cluster_index = new_idx
+            note = self._cluster_notes[new_idx]
+            self._current_note = note["content"]
+            self._display_note(note["content"])
+            self._update_cluster_nav()
+
+    def _save_cluster_to_vault(self) -> None:
+        """Save ALL cluster notes to the vault at once."""
+        if not self._cluster_notes:
+            self._log_msg("No cluster notes to save.", "error")
+            return
+
+        vault = get_vault_path()
+        if not vault:
+            self._log_msg("No vault configured. Set it in Settings.", "error")
+            self._open_settings()
+            return
+
+        # Ask for a subfolder name
+        hub_title = self._cluster_notes[0]["title"]
+        folder = slugify(hub_title)
+
+        # Use a dialog to confirm
+        confirm = tk.Toplevel(self)
+        confirm.title("Save Cluster to Vault")
+        confirm.geometry("420x280")
+        confirm.resizable(False, False)
+        confirm.configure(bg=BG_LIGHT)
+        confirm.transient(self)
+        confirm.grab_set()
+
+        tk.Label(confirm, text="Save Topic Cluster", font=FONT_HEADER, bg=BG_LIGHT, fg=FG_BODY).pack(padx=16, pady=(16, 8))
+        tk.Label(confirm, text=f"{len(self._cluster_notes)} notes will be saved to your vault.",
+                 font=FONT_BODY, bg=BG_LIGHT, fg=FG_BODY).pack(padx=16)
+
+        # Folder input
+        folder_frame = tk.Frame(confirm, bg=BG_LIGHT)
+        folder_frame.pack(fill=tk.X, padx=16, pady=(12, 4))
+        tk.Label(folder_frame, text="Subfolder:", font=FONT_SMALL, bg=BG_LIGHT, fg=FG_BODY).pack(side=tk.LEFT)
+        folder_var = tk.StringVar(value=folder)
+        tk.Entry(folder_frame, textvariable=folder_var, font=FONT_SMALL, width=30).pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
+
+        # Note list preview
+        list_frame = tk.Frame(confirm, bg=BG_LIGHT)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
+        listbox = tk.Listbox(list_frame, font=FONT_SMALL, height=6, bg="#f0edf5", fg=FG_BODY, selectmode=tk.NONE)
+        listbox.pack(fill=tk.BOTH, expand=True)
+        for note in self._cluster_notes:
+            icon = {"hub": "\u2b50", "concept": "\u25cb", "example": "\u25a1", "reference": "\U0001f4d6"}.get(note["type"], "\u25cb")
+            listbox.insert(tk.END, f"  {icon} {note['title']}.md")
+
+        def _do_save():
+            subfolder = folder_var.get().strip()
+            saved_count = 0
+            for note in self._cluster_notes:
+                filename = slugify(note["title"]) + ".md"
+                rel_path = f"{subfolder}/{filename}" if subfolder else filename
+                try:
+                    write_note(rel_path, note["content"], overwrite=False)
+                    saved_count += 1
+                except Exception as e:
+                    self._log_msg(f"Failed to save {note['title']}: {e}", "error")
+            self._log_msg(f"Saved {saved_count}/{len(self._cluster_notes)} notes to {subfolder}/", "success")
+            self._check_vault()
+            confirm.destroy()
+
+        btn_row = tk.Frame(confirm, bg=BG_LIGHT)
+        btn_row.pack(fill=tk.X, padx=16, pady=(0, 12))
+        tk.Button(btn_row, text="Save All", font=FONT_BODY, bg=ACCENT, fg="white",
+                  relief=tk.FLAT, padx=16, pady=4, command=_do_save).pack(side=tk.LEFT)
+        tk.Button(btn_row, text="Cancel", font=FONT_SMALL, bg="#e8e4f0", fg=FG_BODY,
+                  relief=tk.FLAT, padx=10, pady=4, command=confirm.destroy).pack(side=tk.RIGHT)
+
     # ── Note display ─────────────────────────────────────────────────
 
     def _display_note(self, content: str) -> None:
@@ -484,7 +1108,6 @@ class ObsidianMCPApp(tk.Tk):
                 self._preview.tag_add("quote", line_start, line_end)
 
         # Highlight [[wiki-links]]
-        import re
         for match in re.finditer(r'\[\[.+?\]\]', content):
             start_idx = f"1.0+{match.start()}c"
             end_idx = f"1.0+{match.end()}c"
@@ -529,6 +1152,7 @@ class ObsidianMCPApp(tk.Tk):
                 full_path.write_text(self._current_note, encoding="utf-8")
                 self._log_msg(f"Saved: {full_path.name}", "success")
                 self._check_vault()  # refresh note count
+                self._explorer_notes_data.clear()  # force explorer refresh on next visit
             except Exception as e:
                 self._log_msg(f"Save failed: {e}", "error")
 

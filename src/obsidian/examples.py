@@ -29,4 +29,12 @@ EXAMPLES: OrderedDict[str, list[str]] = OrderedDict({
         "Recipe note: Traditional Japanese ramen with detailed steps",
         "Travel planning notes for a 2-week trip to Japan",
     ],
+    "Topic Clusters": [
+        "Machine Learning — from basics to deep learning",
+        "Ancient Rome — politics, culture, engineering, and legacy",
+        "Web Development — frontend, backend, and DevOps",
+        "Climate Change — science, impacts, and solutions",
+        "Human Psychology — cognition, behavior, and mental health",
+        "Blockchain Technology — crypto, smart contracts, and DeFi",
+    ],
 })

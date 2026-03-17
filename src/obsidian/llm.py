@@ -58,6 +58,51 @@ Keep the existing structure where possible. Add new sections, links, or content.
 Output the COMPLETE updated note inside ```markdown fences.
 """
 
+TOPIC_MAP_PROMPT = """\
+You are a knowledge architect. Given a broad topic, generate a topic cluster map
+for an Obsidian knowledge base.
+
+OUTPUT FORMAT: Return ONLY a JSON array of objects inside ```json fences.
+Each object has: "title" (string), "description" (one sentence), "type" (one of: hub, concept, example, reference).
+
+RULES:
+1. First item MUST be the hub note (type: "hub") — the main overview
+2. Generate 5-9 subtopic notes that branch from the hub
+3. Include a mix of: core concepts, practical examples, and references
+4. Titles should be concise (2-5 words) and work as [[wiki-links]]
+5. Subtopics should be interconnected — not just linked to the hub
+6. Think in terms of an Obsidian graph: create a web, not a star
+
+Example output:
+```json
+[
+  {"title": "Machine Learning", "description": "Overview of ML paradigms and applications", "type": "hub"},
+  {"title": "Supervised Learning", "description": "Learning from labeled training data", "type": "concept"},
+  {"title": "Neural Networks", "description": "Interconnected layers of artificial neurons", "type": "concept"},
+  {"title": "Gradient Descent", "description": "Optimization algorithm for training models", "type": "concept"},
+  {"title": "Image Classification", "description": "Practical example using CNNs", "type": "example"},
+  {"title": "Overfitting", "description": "When models memorize rather than generalize", "type": "concept"},
+  {"title": "ML Glossary", "description": "Key terms and definitions", "type": "reference"}
+]
+```
+"""
+
+CLUSTER_NOTE_PROMPT = """\
+You are generating ONE note in a topic cluster for an Obsidian knowledge base.
+
+CLUSTER CONTEXT:
+- Hub topic: {hub_title}
+- All notes in this cluster: {all_titles}
+- This note's role: {note_type}
+
+IMPORTANT:
+1. Generate the note for: "{note_title}" — {note_description}
+2. Use [[wiki-links]] to link to OTHER notes in this cluster (use exact titles from the list above)
+3. Also link to concepts OUTSIDE this cluster that could be future notes
+4. The "See Also" section MUST reference at least 2-3 other cluster notes
+5. Keep content focused and atomic — this is ONE piece of a larger knowledge web
+"""
+
 
 def generate_note(
     prompt: str,
@@ -112,7 +157,7 @@ def generate_note(
     return result, False
 
 
-def _generate_gemini(user_msg: str) -> str:
+def _generate_gemini(user_msg: str, system_override: str = "", raw: bool = False) -> str:
     """Generate via Gemini API."""
     from google import genai
 
@@ -123,6 +168,7 @@ def _generate_gemini(user_msg: str) -> str:
         )
 
     client = genai.Client(api_key=api_key)
+    system = system_override or SYSTEM_PROMPT
 
     result_container: list = []
     error_container: list = []
@@ -133,7 +179,7 @@ def _generate_gemini(user_msg: str) -> str:
                 model=cfg.GEMINI_MODEL,
                 contents=user_msg,
                 config=genai.types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
+                    system_instruction=system,
                 ),
             )
             result_container.append(response.text)
@@ -151,15 +197,18 @@ def _generate_gemini(user_msg: str) -> str:
     if not result_container:
         raise RuntimeError("Gemini returned no response.")
 
+    if raw:
+        return result_container[0]
     return _extract_markdown(result_container[0])
 
 
-def _generate_ollama(user_msg: str) -> str:
+def _generate_ollama(user_msg: str, system_override: str = "", raw: bool = False) -> str:
     """Generate via local Ollama."""
     import ollama
 
+    system = system_override or SYSTEM_PROMPT
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": user_msg},
     ]
 
@@ -188,7 +237,102 @@ def _generate_ollama(user_msg: str) -> str:
     if not result_container:
         raise RuntimeError("Ollama returned no response.")
 
+    if raw:
+        return result_container[0]
     return _extract_markdown(result_container[0])
+
+
+def generate_topic_map(topic: str) -> list[dict]:
+    """Generate a topic cluster map (list of subtopics) for a broad topic.
+
+    Returns:
+        List of dicts with keys: title, description, type.
+    """
+    import json as _json
+
+    user_msg = f"Generate a topic cluster map for: {topic}"
+
+    if cfg.LLM_PROVIDER == "gemini":
+        result = _generate_gemini(user_msg, system_override=TOPIC_MAP_PROMPT, raw=True)
+    else:
+        result = _generate_ollama(user_msg, system_override=TOPIC_MAP_PROMPT, raw=True)
+
+    # Extract JSON from the response
+    result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL)
+    json_match = re.search(r"```json\s*\n(.*?)```", result, re.DOTALL)
+    if json_match:
+        raw = json_match.group(1).strip()
+    else:
+        # Try to find a raw JSON array
+        arr_match = re.search(r'\[.*\]', result, re.DOTALL)
+        if arr_match:
+            raw = arr_match.group(0)
+        else:
+            raise RuntimeError("LLM did not return a valid topic map. Try again.")
+
+    try:
+        topics = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse topic map JSON: {e}")
+
+    if not isinstance(topics, list) or len(topics) < 2:
+        raise RuntimeError("Topic map must contain at least 2 entries.")
+
+    # Validate structure
+    for t in topics:
+        if "title" not in t:
+            raise RuntimeError(f"Topic entry missing 'title': {t}")
+        t.setdefault("description", "")
+        t.setdefault("type", "concept")
+
+    return topics
+
+
+def generate_cluster_note(
+    note_title: str,
+    note_description: str,
+    note_type: str,
+    hub_title: str,
+    all_titles: list[str],
+    template: str = "standard",
+    vault_context: str = "",
+) -> str:
+    """Generate a single note within a topic cluster.
+
+    Args:
+        note_title: Title of this specific note.
+        note_description: One-sentence description.
+        note_type: Role in cluster (hub, concept, example, reference).
+        hub_title: The main hub topic title.
+        all_titles: All note titles in the cluster.
+        template: Note template style.
+        vault_context: Existing vault note titles.
+
+    Returns:
+        Generated markdown string.
+    """
+    cluster_context = CLUSTER_NOTE_PROMPT.format(
+        hub_title=hub_title,
+        all_titles=", ".join(f"[[{t}]]" for t in all_titles),
+        note_type=note_type,
+        note_title=note_title,
+        note_description=note_description,
+    )
+
+    parts = [cluster_context]
+    if vault_context:
+        parts.append(f"Existing notes in vault (also link to these if relevant): {vault_context}")
+    parts.append(f"Template style: {template}")
+    parts.append(f"Generate the complete note for: {note_title}")
+
+    user_msg = "\n\n".join(parts)
+
+    if cfg.LLM_PROVIDER == "gemini":
+        result = _generate_gemini(user_msg)
+    else:
+        result = _generate_ollama(user_msg)
+
+    return result
 
 
 def _extract_markdown(text: str) -> str:

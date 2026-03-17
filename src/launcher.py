@@ -1,4 +1,4 @@
-"""Launcher homepage — choose between Blender, Obsidian, or Krita tools."""
+"""Launcher homepage — choose between Blender, Obsidian, Krita, or Pencil tools."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ FG_ACCENT = "#38bdf8"
 ACCENT_BLENDER = "#ea7600"
 ACCENT_OBSIDIAN = "#7c3aed"
 ACCENT_KRITA = "#2dd4bf"
+ACCENT_PENCIL = "#6366f1"
 
 
 # ── Tool definitions ─────────────────────────────────────────────────
@@ -53,10 +54,23 @@ TOOLS = [
         "tagline": "Text to 2D Art",
         "description": (
             "Generate digital paintings, illustrations,\n"
-            "and concept art from text descriptions."
+            "and concept art with AI image generation."
         ),
-        "status": "Coming Soon",
+        "status": "Ready",
         "launch": "_launch_krita",
+    },
+    {
+        "id": "pencil",
+        "name": "Pencil",
+        "icon": "\u270f\ufe0f",  # pencil
+        "accent": ACCENT_PENCIL,
+        "tagline": "Text to UI Design",
+        "description": (
+            "Generate responsive UI designs, landing pages,\n"
+            "dashboards, and components as production code."
+        ),
+        "status": "Ready",
+        "launch": "_launch_pencil",
     },
 ]
 
@@ -65,8 +79,8 @@ class LauncherApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Creative MCP Suite")
-        self.geometry("860x520")
-        self.minsize(750, 450)
+        self.geometry("1120x520")
+        self.minsize(1000, 450)
         self.configure(bg=BG_DARK)
         self._build_ui()
 
@@ -155,7 +169,7 @@ class LauncherApp(tk.Tk):
         tk.Label(
             card, text=tool["description"],
             font=("Segoe UI", 10), bg=BG_CARD, fg=FG_BODY,
-            justify=tk.LEFT, anchor=tk.NW, wraplength=220,
+            justify=tk.LEFT, anchor=tk.NW, wraplength=200,
         ).pack(fill=tk.X, pady=(4, 12))
 
         # Spacer to push button to bottom
@@ -236,8 +250,20 @@ class LauncherApp(tk.Tk):
         app.mainloop()
 
     def _launch_krita(self) -> None:
-        """Placeholder — Krita not yet implemented."""
-        pass
+        """Launch the Krita MCP tool."""
+        self.withdraw()
+        from src.krita.gui import KritaMCPApp
+        app = KritaMCPApp()
+        app.protocol("WM_DELETE_WINDOW", lambda: self._on_tool_close(app))
+        app.mainloop()
+
+    def _launch_pencil(self) -> None:
+        """Launch the Pencil MCP tool."""
+        self.withdraw()
+        from src.pencil.gui import PencilMCPApp
+        app = PencilMCPApp()
+        app.protocol("WM_DELETE_WINDOW", lambda: self._on_tool_close(app))
+        app.mainloop()
 
     def _on_tool_close(self, tool_window: tk.Tk) -> None:
         """When a tool window closes, show the launcher again."""

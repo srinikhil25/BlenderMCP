@@ -91,20 +91,34 @@ def _build_full_prompt(
     framework: str,
     color_theme: str,
 ) -> str:
-    """Build the full user prompt with design type hints and theme."""
-    parts = []
+    """Build the full user prompt with design type hints and theme.
 
-    # Design type hint
+    Uses TOON format for structured config data to save ~30% tokens.
+    """
+    from src.toon import encode_key_value
+
+    # TOON-encode the design configuration (compact key-value pairs)
+    config_data = {}
+
     dt = pencil_cfg.DESIGN_TYPES.get(design_type, {})
+    if dt.get("name"):
+        config_data["design_type"] = dt["name"]
     if dt.get("prompt_hint"):
-        parts.append(f"Design type: {dt['name']}. {dt['prompt_hint']}")
+        config_data["type_hint"] = dt["prompt_hint"]
 
-    # Color theme hint
     ct = pencil_cfg.COLOR_THEMES.get(color_theme, {})
+    if ct.get("name"):
+        config_data["color_theme"] = ct["name"]
     if ct.get("hint"):
-        parts.append(f"Color theme: {ct['name']}. {ct['hint']}.")
+        config_data["theme_hint"] = ct["hint"]
 
-    # Framework-specific hints
+    config_data["framework"] = framework
+
+    parts = []
+    # TOON-encoded config block
+    parts.append(f"--- design_config ---\n{encode_key_value(config_data)}")
+
+    # Framework-specific hints (plain text — these are instructions, not data)
     if framework == "html_bootstrap":
         parts.append(
             "Use Bootstrap 5 via CDN. Include the Bootstrap CSS and JS links in <head>. "

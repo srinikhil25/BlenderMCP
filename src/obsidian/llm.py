@@ -137,7 +137,8 @@ def generate_note(
     if existing_content:
         parts.append(MODIFY_PROMPT.format(note_content=existing_content))
     if vault_context:
-        parts.append(f"Existing notes in vault (use for [[wiki-links]]): {vault_context}")
+        # TOON table format passed by caller — rich metadata in compact form
+        parts.append(f"Existing notes in vault (use for [[wiki-links]]):\n{vault_context}")
     parts.append(f"Template style: {template}")
     parts.append(prompt)
     if feedback:
@@ -321,7 +322,8 @@ def generate_cluster_note(
 
     parts = [cluster_context]
     if vault_context:
-        parts.append(f"Existing notes in vault (also link to these if relevant): {vault_context}")
+        # TOON table format passed by caller
+        parts.append(f"Existing notes in vault (also link to these if relevant):\n{vault_context}")
     parts.append(f"Template style: {template}")
     parts.append(f"Generate the complete note for: {note_title}")
 

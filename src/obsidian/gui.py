@@ -49,6 +49,27 @@ PIPELINE_STEPS = ["Generate", "Process", "Save"]
 CLUSTER_STEPS = ["Map", "Generate", "Link", "Save"]
 
 
+def _build_vault_metadata(vault_path: Path, limit: int = 50) -> list[dict]:
+    """Build structured vault metadata for TOON-encoded LLM context.
+
+    Returns a list of dicts with {title, links, tags} — perfect for
+    TOON tabular encoding (saves ~45% tokens vs JSON equivalent).
+    """
+    notes = list_notes()[:limit]
+    result = []
+    for note_path in notes:
+        full = vault_path / note_path
+        title = Path(note_path).stem
+        try:
+            content = full.read_text(encoding="utf-8")
+        except Exception:
+            content = ""
+        link_count = len(re.findall(r'\[\[(.+?)\]\]', content))
+        tags = " ".join(re.findall(r'#([\w-]+)', content)[:3])
+        result.append({"title": title, "links": link_count, "tags": tags})
+    return result
+
+
 class ObsidianMCPApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -751,12 +772,14 @@ class ObsidianMCPApp(tk.Tk):
                 self._log_msg(f"  Modify mode: {len(existing)} chars existing", "info")
 
             # Get vault context for wiki-link suggestions
+            # TOON table format for rich metadata (saves ~45% vs JSON)
             vault_context = ""
             vault = get_vault_path()
             if vault:
-                titles = list_note_titles()[:50]  # top 50 for context
-                if titles:
-                    vault_context = ", ".join(titles)
+                from src.toon import encode_table
+                notes_meta = _build_vault_metadata(vault, limit=50)
+                if notes_meta:
+                    vault_context = encode_table(notes_meta, "vault_notes")
 
             try:
                 note, was_cached = generate_note(
@@ -885,9 +908,10 @@ class ObsidianMCPApp(tk.Tk):
             vault_context = ""
             vault = get_vault_path()
             if vault:
-                existing = list_note_titles()[:50]
-                if existing:
-                    vault_context = ", ".join(existing)
+                from src.toon import encode_table
+                notes_meta = _build_vault_metadata(vault, limit=50)
+                if notes_meta:
+                    vault_context = encode_table(notes_meta, "vault_notes")
 
             cluster_notes: list[dict] = []
             for i, t in enumerate(topic_map):
